@@ -20,6 +20,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=7.0.0", "pytest-asyncio>=0.20.0", "mypy>=1.0.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.20.0", "mypy>=1.0.0", "ruff==0.16.9", "build", "twine"]
 
 [project.scripts]
 swarmconsensus = "swarmconsensus.cli:main"
@@ -32,3 +33,9 @@ swarmconsensus = ["py.typed"]
 
 [project.urls]
 Homepage = "https://github.com/mbgulden/swarmconsensus"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PIE"]

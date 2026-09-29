@@ -1,26 +1,28 @@
 """Main Raft node implementation."""
 
 import asyncio
+import contextlib
 import time
+from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-from .types import (
-    ClusterConfig,
-    NodeState,
-    LogEntry,
-    VoteRequest,
-    VoteResponse,
-    AppendRequest,
-    AppendResponse,
-    ConsensusStats,
-    NotLeaderError,
-)
-from .log import ConsensusLog
 from .election import Election
 from .epoch import EpochManager
+from .log import ConsensusLog
 from .state_machine import StateMachine
-from .transport import Transport, InProcessTransport
+from .transport import InProcessTransport, Transport
+from .types import (
+    AppendRequest,
+    AppendResponse,
+    ClusterConfig,
+    ConsensusStats,
+    LogEntry,
+    NodeState,
+    NotLeaderError,
+    VoteRequest,
+    VoteResponse,
+)
 
 
 class RaftNode:
@@ -39,17 +41,20 @@ class RaftNode:
         self.election = Election(config, self.log)
         self.epoch_manager = EpochManager(config.node_id)
         self.state_machine = StateMachine()
-        
+
         self._state = NodeState.FOLLOWER
         self._leader_id: Optional[str] = None
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
-        
+        # Fire-and-forget send tasks; referenced here so they are not GC'd
+        # before completing.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
         # Leader state
-        self._next_index: Dict[str, int] = {}
-        self._match_index: Dict[str, int] = {}
+        self._next_index: dict[str, int] = {}
+        self._match_index: dict[str, int] = {}
         self._last_applied = 0
-        
+
         # Restore commit index and applied index from log
         self.log.commit(0)  # Dummy init
         self._apply_committed_entries()
@@ -87,20 +92,33 @@ class RaftNode:
         self._running = False
         if self._loop_task:
             self._loop_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
-            except asyncio.CancelledError:
-                pass
+        for task in self._background_tasks:
+            task.cancel()
 
-    async def propose(self, command: str, data: Dict[str, Any]) -> LogEntry:
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        """Run a coroutine as a referenced background task (RUF006).
+
+        Fire-and-forget ``asyncio.create_task`` calls risk garbage collection
+        before completion; the task set holds the reference instead.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def propose(self, command: str, data: dict[str, Any]) -> LogEntry:
         """Propose a new log entry.
-        
+
         Raises:
             NotLeaderError: If the node is not the leader.
         """
         if self._state != NodeState.LEADER:
-            raise NotLeaderError(f"Cannot propose: not leader. Leader is {self._leader_id}")
-            
+            raise NotLeaderError(
+                f"Cannot propose: not leader. Leader is {self._leader_id}"
+            )
+
         entry = LogEntry(
             term=self.election.current_term,
             index=self.log.last_index() + 1,
@@ -109,10 +127,10 @@ class RaftNode:
             timestamp=time.time(),
         )
         self.log.append(entry)
-        
+
         # Update leader's own match index
         self._match_index[self.config.node_id] = entry.index
-        
+
         # Wake up heartbeat loop to broadcast immediately
         await self._broadcast_append_entries()
         return entry
@@ -122,24 +140,24 @@ class RaftNode:
         try:
             # Task for processing incoming messages
             msg_task = asyncio.create_task(self._process_messages())
-            
+
             while self._running:
                 if self._state == NodeState.FOLLOWER:
                     if self.election.has_timed_out():
                         self._become_candidate()
                     await asyncio.sleep(0.01)
-                    
+
                 elif self._state == NodeState.CANDIDATE:
                     if self.election.has_timed_out():
                         # Restart election
                         self._become_candidate()
                     await asyncio.sleep(0.01)
-                    
+
                 elif self._state == NodeState.LEADER:
                     await self._broadcast_append_entries()
                     await asyncio.sleep(self.config.heartbeat_interval_ms / 1000.0)
         finally:
-            if 'msg_task' in locals():
+            if "msg_task" in locals():
                 msg_task.cancel()
 
     async def _process_messages(self) -> None:
@@ -153,10 +171,10 @@ class RaftNode:
             except Exception as e:
                 print(f"Error processing message: {e}")
 
-    async def _handle_message(self, msg: Dict[str, Any]) -> None:
+    async def _handle_message(self, msg: dict[str, Any]) -> None:
         """Handle a single message."""
         msg_type = msg.get("type")
-        
+
         if msg_type == "vote_request":
             req = VoteRequest(**msg["request"])
             await self._handle_vote_request(req)
@@ -186,12 +204,12 @@ class RaftNode:
         self._state = NodeState.CANDIDATE
         self._leader_id = None
         term = self.election.start_election()
-        
+
         # Single node cluster wins immediately
         if not self.config.peers:
             self._become_leader()
             return
-            
+
         # Send vote requests
         req = VoteRequest(
             term=term,
@@ -199,7 +217,7 @@ class RaftNode:
             last_log_index=self.log.last_index(),
             last_log_term=self.log.last_term(),
         )
-        
+
         msg = {
             "type": "vote_request",
             "request": {
@@ -207,43 +225,44 @@ class RaftNode:
                 "candidate_id": req.candidate_id,
                 "last_log_index": req.last_log_index,
                 "last_log_term": req.last_log_term,
-            }
+            },
         }
-        
+
         for peer in self.config.peers:
-            asyncio.create_task(self.transport.send(peer, msg))
+            self._spawn(self.transport.send(peer, msg))
 
     def _become_leader(self) -> None:
         """Transition to leader state."""
         self._state = NodeState.LEADER
         self._leader_id = self.config.node_id
-        
+
         # Initialize leader state
         last_index = self.log.last_index()
         self._next_index = {peer: last_index + 1 for peer in self.config.peers}
         self._match_index = {peer: 0 for peer in self.config.peers}
         self._match_index[self.config.node_id] = last_index
-        
+
         # Grant initial epoch lease
         self.epoch_manager.grant_lease(self.election.current_term)
-        
-        # Append a no-op entry to establish log authority (optional in basic Raft, but good practice)
+
+        # Append a no-op entry to establish log authority
+        # (optional in basic Raft, but good practice)
         # We skip it here to keep tests simple
 
     async def _handle_vote_request(self, req: VoteRequest) -> None:
         """Handle incoming vote request."""
         if req.term > self.election.current_term:
             self._become_follower(req.term)
-            
+
         resp = self.election.request_vote(req)
-        
+
         msg = {
             "type": "vote_response",
             "response": {
                 "term": resp.term,
                 "vote_granted": resp.vote_granted,
                 "voter_id": resp.voter_id,
-            }
+            },
         }
         await self.transport.send(req.candidate_id, msg)
 
@@ -251,11 +270,11 @@ class RaftNode:
         """Handle incoming vote response."""
         if self._state != NodeState.CANDIDATE:
             return
-            
+
         if resp.term > self.election.current_term:
             self._become_follower(resp.term)
             return
-            
+
         if self.election.receive_vote(resp):
             self._become_leader()
 
@@ -263,20 +282,20 @@ class RaftNode:
         """Broadcast append entries to all peers."""
         if self._state != NodeState.LEADER:
             return
-            
+
         # Renew lease
         if self.epoch_manager._current_lease:
             self.epoch_manager.renew_lease(self.epoch_manager._current_lease)
-            
+
         for peer in self.config.peers:
             next_idx = self._next_index[peer]
             prev_log_index = next_idx - 1
-            
+
             prev_entry = self.log.get(prev_log_index)
             prev_log_term = prev_entry.term if prev_entry else 0
-            
+
             entries = self.log.slice(next_idx, self.log.last_index() + 1)
-            
+
             req = AppendRequest(
                 term=self.election.current_term,
                 leader_id=self.config.node_id,
@@ -285,7 +304,7 @@ class RaftNode:
                 entries=entries,
                 leader_commit=self.log.commit_index,
             )
-            
+
             # Serialize entries
             entries_data = [
                 {
@@ -297,7 +316,7 @@ class RaftNode:
                 }
                 for e in entries
             ]
-            
+
             msg = {
                 "type": "append_request",
                 "request": {
@@ -307,9 +326,13 @@ class RaftNode:
                     "prev_log_term": req.prev_log_term,
                     "entries": entries_data,
                     "leader_commit": req.leader_commit,
-                }
+                },
             }
-            asyncio.create_task(self.transport.send(peer, msg))
+            self._spawn(self.transport.send(peer, msg))
+
+        # The leader can commit its own entries without waiting for a
+        # response round-trip (single-node clusters commit here).
+        self._advance_commit_index()
 
     async def _handle_append_request(self, req: AppendRequest) -> None:
         """Handle incoming append entries request."""
@@ -321,30 +344,32 @@ class RaftNode:
             else:
                 self._leader_id = req.leader_id
                 self.election.reset_election_timer()
-                
+
         success = False
         match_index = 0
-        
+
         if req.term >= self.election.current_term:
             # Check prev log index and term
             prev_entry = self.log.get(req.prev_log_index)
-            if req.prev_log_index == 0 or (prev_entry and prev_entry.term == req.prev_log_term):
+            if req.prev_log_index == 0 or (
+                prev_entry and prev_entry.term == req.prev_log_term
+            ):
                 success = True
-                
+
                 # Truncate conflicting entries and append new ones
                 if req.entries:
                     self.log.truncate_after(req.prev_log_index)
                     for entry in req.entries:
                         self.log.append(entry)
-                        
+
                 match_index = req.prev_log_index + len(req.entries)
-                
+
                 # Update commit index
                 if req.leader_commit > self.log.commit_index:
                     new_commit = min(req.leader_commit, match_index)
                     self.log.commit(new_commit)
                     self._apply_committed_entries()
-            
+
         msg = {
             "type": "append_response",
             "response": {
@@ -352,7 +377,7 @@ class RaftNode:
                 "success": success,
                 "match_index": match_index,
                 "follower_id": self.config.node_id,
-            }
+            },
         }
         await self.transport.send(req.leader_id, msg)
 
@@ -360,16 +385,16 @@ class RaftNode:
         """Handle incoming append entries response."""
         if self._state != NodeState.LEADER:
             return
-            
+
         if resp.term > self.election.current_term:
             self._become_follower(resp.term)
             return
-            
+
         peer = resp.follower_id
         if resp.success:
             self._match_index[peer] = resp.match_index
             self._next_index[peer] = resp.match_index + 1
-            
+
             # Check if we can advance commit index
             self._advance_commit_index()
         else:
@@ -383,9 +408,9 @@ class RaftNode:
         # Nth highest match index where N is majority
         cluster_size = len(self.config.peers) + 1
         majority_idx = cluster_size // 2
-        
+
         candidate_commit = match_indices[majority_idx]
-        
+
         if candidate_commit > self.log.commit_index:
             # Only commit entries from current term
             entry = self.log.get(candidate_commit)

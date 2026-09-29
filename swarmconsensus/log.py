@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from .types import LogEntry
 
@@ -13,7 +13,7 @@ class ConsensusLog:
 
     def __init__(self, db_path: Optional[Path] = None):
         """Initialize the consensus log.
-        
+
         Args:
             db_path: Path to the SQLite database file. If None, uses in-memory.
         """
@@ -27,7 +27,7 @@ class ConsensusLog:
     def _init_db(self) -> None:
         """Initialize the database schema."""
         cursor = self._conn.cursor()
-        cursor.execute('''
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS log_entries (
                 "index" INTEGER PRIMARY KEY,
                 term INTEGER NOT NULL,
@@ -35,33 +35,42 @@ class ConsensusLog:
                 data TEXT NOT NULL,
                 timestamp REAL NOT NULL
             )
-        ''')
+        """)
         # Insert a dummy entry at index 0 to simplify logic
-        cursor.execute('''
+        cursor.execute("""
             INSERT OR IGNORE INTO log_entries ("index", term, command, data, timestamp)
             VALUES (0, 0, 'init', '{}', 0.0)
-        ''')
+        """)
         self._conn.commit()
 
     def append(self, entry: LogEntry) -> None:
         """Append an entry to the log.
-        
+
         Args:
             entry: The log entry to append.
         """
         cursor = self._conn.cursor()
-        cursor.execute('''
+        cursor.execute(
+            """
             INSERT OR REPLACE INTO log_entries ("index", term, command, data, timestamp)
             VALUES (?, ?, ?, ?, ?)
-        ''', (entry.index, entry.term, entry.command, json.dumps(entry.data), entry.timestamp))
+        """,
+            (
+                entry.index,
+                entry.term,
+                entry.command,
+                json.dumps(entry.data),
+                entry.timestamp,
+            ),
+        )
         self._conn.commit()
 
     def get(self, index: int) -> Optional[LogEntry]:
         """Get the log entry at the specified index.
-        
+
         Args:
             index: The index of the entry to get.
-            
+
         Returns:
             The log entry, or None if not found.
         """
@@ -71,11 +80,11 @@ class ConsensusLog:
         if row is None:
             return None
         return LogEntry(
-            term=row['term'],
-            index=row['index'],
-            command=row['command'],
-            data=json.loads(row['data']),
-            timestamp=row['timestamp'],
+            term=row["term"],
+            index=row["index"],
+            command=row["command"],
+            data=json.loads(row["data"]),
+            timestamp=row["timestamp"],
         )
 
     def last_index(self) -> int:
@@ -90,37 +99,42 @@ class ConsensusLog:
         entry = self.get(self.last_index())
         return entry.term if entry else 0
 
-    def slice(self, start: int, end: int) -> List[LogEntry]:
+    def slice(self, start: int, end: int) -> list[LogEntry]:
         """Get a slice of log entries from start (inclusive) to end (exclusive).
-        
+
         Args:
             start: The start index (inclusive).
             end: The end index (exclusive).
-            
+
         Returns:
             A list of log entries.
         """
         cursor = self._conn.cursor()
-        cursor.execute('''
+        cursor.execute(
+            """
             SELECT * FROM log_entries
             WHERE "index" >= ? AND "index" < ?
             ORDER BY "index" ASC
-        ''', (start, end))
-        
+        """,
+            (start, end),
+        )
+
         entries = []
         for row in cursor.fetchall():
-            entries.append(LogEntry(
-                term=row['term'],
-                index=row['index'],
-                command=row['command'],
-                data=json.loads(row['data']),
-                timestamp=row['timestamp'],
-            ))
+            entries.append(
+                LogEntry(
+                    term=row["term"],
+                    index=row["index"],
+                    command=row["command"],
+                    data=json.loads(row["data"]),
+                    timestamp=row["timestamp"],
+                )
+            )
         return entries
 
     def truncate_after(self, index: int) -> None:
         """Remove all entries after the specified index.
-        
+
         Args:
             index: The index after which entries should be removed.
         """
@@ -130,7 +144,7 @@ class ConsensusLog:
 
     def commit(self, index: int) -> None:
         """Mark entries up to the specified index as committed.
-        
+
         Args:
             index: The index up to which entries are committed.
         """

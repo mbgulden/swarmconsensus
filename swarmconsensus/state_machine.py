@@ -1,6 +1,6 @@
 """Replicated state machine implementation."""
 
-from typing import Any, Dict
+from typing import Any
 
 from .types import LogEntry
 
@@ -10,14 +10,14 @@ class StateMachine:
 
     def __init__(self):
         """Initialize the state machine."""
-        self._state: Dict[str, Any] = {}
+        self._state: dict[str, Any] = {}
 
     def apply(self, entry: LogEntry) -> Any:
         """Apply a log entry to the state machine.
-        
+
         Args:
             entry: The log entry to apply.
-            
+
         Returns:
             The result of applying the entry.
         """
@@ -32,13 +32,13 @@ class StateMachine:
             if key in self._state:
                 return self._state.pop(key)
         elif entry.command == "init":
-            pass # No-op for init entry
-        
+            pass  # No-op for init entry
+
         return None
 
     def snapshot(self) -> dict:
         """Create a snapshot of the current state.
-        
+
         Returns:
             A dictionary representation of the state.
         """
@@ -46,7 +46,7 @@ class StateMachine:
 
     def restore(self, snapshot: dict) -> None:
         """Restore the state machine from a snapshot.
-        
+
         Args:
             snapshot: The snapshot to restore from.
         """
